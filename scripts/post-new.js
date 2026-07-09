@@ -3,6 +3,7 @@ const path = require("path");
 
 const REPO_ROOT = path.join(__dirname, "..");
 const IMAGES_DIR = path.join(REPO_ROOT, "images");
+const VIDEOS_DIR = path.join(REPO_ROOT, "videos");
 const CAPTIONS_DIR = path.join(REPO_ROOT, "captions");
 const LEDGER_PATH = path.join(REPO_ROOT, "posted.json");
 
@@ -28,16 +29,15 @@ function saveLedger(ledger) {
   fs.writeFileSync(LEDGER_PATH, JSON.stringify(ledger, null, 2) + "\n");
 }
 
-function rawUrlFor(filename) {
+function rawUrlFor(dir, filename) {
   const encoded = filename
     .split("/")
     .map((seg) => encodeURIComponent(seg))
     .join("/");
-  return `https://raw.githubusercontent.com/${REPO}/main/images/${encoded}`;
+  return `https://raw.githubusercontent.com/${REPO}/main/${dir}/${encoded}`;
 }
 
-function captionFor(filename) {
-  const base = filename.replace(/\.[^.]+$/, "");
+function captionFor(base) {
   const captionPath = path.join(CAPTIONS_DIR, `${base}.txt`);
   if (!fs.existsSync(captionPath)) return null;
   const text = fs.readFileSync(captionPath, "utf8").trim();
@@ -60,7 +60,7 @@ async function graphPost(igPath, params) {
   return body;
 }
 
-async function waitUntilFinished(creationId, maxTries = 10, intervalMs = 3000) {
+async function waitUntilFinished(creationId, maxTries, intervalMs) {
   for (let i = 0; i < maxTries; i++) {
     const { status_code } = await graphGet(
       `/${creationId}?fields=status_code&access_token=${TOKEN}`
@@ -74,24 +74,41 @@ async function waitUntilFinished(creationId, maxTries = 10, intervalMs = 3000) {
   throw new Error("メディアコンテナの生成待ちがタイムアウトしました");
 }
 
-async function postImage(igUserId, filename, caption) {
-  const image_url = rawUrlFor(filename);
-  console.log(`[${filename}] コンテナ作成: ${image_url}`);
+async function createAndPublish(igUserId, label, containerParams, waitOpts) {
   const { id: creationId } = await graphPost(`/${igUserId}/media`, {
-    image_url,
-    caption,
+    ...containerParams,
     access_token: TOKEN,
   });
 
-  await waitUntilFinished(creationId);
+  await waitUntilFinished(creationId, waitOpts.maxTries, waitOpts.intervalMs);
 
-  console.log(`[${filename}] 公開実行`);
   const { id: mediaId } = await graphPost(`/${igUserId}/media_publish`, {
     creation_id: creationId,
     access_token: TOKEN,
   });
 
+  console.log(`  ${label}: 投稿完了 media_id=${mediaId}`);
   return mediaId;
+}
+
+async function postStory(igUserId, base, imageFile) {
+  const image_url = rawUrlFor("images", imageFile);
+  return createAndPublish(
+    igUserId,
+    "story",
+    { image_url, media_type: "STORIES" },
+    { maxTries: 10, intervalMs: 3000 }
+  );
+}
+
+async function postReel(igUserId, base, videoFile, caption) {
+  const video_url = rawUrlFor("videos", videoFile);
+  return createAndPublish(
+    igUserId,
+    "reel",
+    { video_url, media_type: "REELS", caption },
+    { maxTries: 20, intervalMs: 5000 } // 動画処理は時間がかかるため長めに待つ
+  );
 }
 
 async function main() {
@@ -101,42 +118,60 @@ async function main() {
   console.log(`Instagramアカウント: @${username} (${igUserId})`);
 
   const ledger = loadLedger();
-  const files = fs
-    .readdirSync(IMAGES_DIR)
-    .filter((f) => /\.(png|jpe?g)$/i.test(f))
-    .filter((f) => !ledger[f]);
 
-  if (files.length === 0) {
-    console.log("新規投稿対象はありません");
-    return;
-  }
+  const imageFiles = fs
+    .readdirSync(IMAGES_DIR)
+    .filter((f) => /\.(png|jpe?g)$/i.test(f));
+  const videoFiles = fs.existsSync(VIDEOS_DIR)
+    ? fs.readdirSync(VIDEOS_DIR).filter((f) => /\.mp4$/i.test(f))
+    : [];
+
+  const bases = [...new Set(imageFiles.map((f) => f.replace(/\.[^.]+$/, "")))];
 
   let hadError = false;
 
-  for (const filename of files) {
-    const caption = captionFor(filename);
+  for (const base of bases) {
+    const imageFile = imageFiles.find((f) => f.replace(/\.[^.]+$/, "") === base);
+    const videoFile = videoFiles.find((f) => f.replace(/\.[^.]+$/, "") === base);
+    const caption = captionFor(base);
+
     if (!caption) {
-      console.warn(
-        `[${filename}] captions/${filename.replace(/\.[^.]+$/, "")}.txt が未記入のためスキップ`
-      );
+      console.warn(`[${base}] captions/${base}.txt が未記入のためスキップ`);
       continue;
     }
 
-    try {
-      const mediaId = await postImage(igUserId, filename, caption);
-      ledger[filename] = {
-        mediaId,
-        postedAt: new Date().toISOString(),
-      };
-      saveLedger(ledger);
-      console.log(`[${filename}] 投稿完了: media_id=${mediaId}`);
-    } catch (err) {
-      hadError = true;
-      console.error(`[${filename}] 投稿失敗: ${err.message}`);
+    ledger[base] = ledger[base] || {};
+    let didSomething = false;
+
+    console.log(`[${base}] 処理開始`);
+
+    if (!ledger[base].story) {
+      try {
+        const mediaId = await postStory(igUserId, base, imageFile);
+        ledger[base].story = { mediaId, postedAt: new Date().toISOString() };
+        didSomething = true;
+      } catch (err) {
+        hadError = true;
+        console.error(`  story: 投稿失敗 ${err.message}`);
+      }
+      await new Promise((r) => setTimeout(r, 5000));
     }
 
-    // Instagram側のレート制限に配慮し、複数投稿時は間隔を空ける
-    await new Promise((r) => setTimeout(r, 5000));
+    if (!videoFile) {
+      console.warn(`  reel: videos/${base}.mp4 が無いためスキップ`);
+    } else if (!ledger[base].reel) {
+      try {
+        const mediaId = await postReel(igUserId, base, videoFile, caption);
+        ledger[base].reel = { mediaId, postedAt: new Date().toISOString() };
+        didSomething = true;
+      } catch (err) {
+        hadError = true;
+        console.error(`  reel: 投稿失敗 ${err.message}`);
+      }
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+
+    if (didSomething) saveLedger(ledger);
   }
 
   if (hadError) process.exitCode = 1;
