@@ -32,6 +32,7 @@ jobs:
         run: node scripts/post-new.js
 
       - name: Commit posted.json ledger
+        if: always()
         run: |
           git config user.name "ig-auto-poster"
           git config user.email "actions@users.noreply.github.com"
