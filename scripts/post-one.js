@@ -44,6 +44,12 @@ function captionFor(base) {
   return text.length > 0 ? text : null;
 }
 
+// 先頭の数字（例: "02_Yunth..." -> 2）でソートする。ランキング順=投稿順の想定
+function naturalKey(base) {
+  const m = base.match(/^(\d+)/);
+  return m ? parseInt(m[1], 10) : Number.MAX_SAFE_INTEGER;
+}
+
 async function graphGet(pathAndQuery) {
   const res = await fetch(`${GRAPH_API}${pathAndQuery}`);
   const body = await res.json();
@@ -91,7 +97,7 @@ async function createAndPublish(igUserId, label, containerParams, waitOpts) {
   return mediaId;
 }
 
-async function postStory(igUserId, base, imageFile) {
+async function postStory(igUserId, imageFile) {
   const image_url = rawUrlFor("images", imageFile);
   return createAndPublish(
     igUserId,
@@ -101,7 +107,7 @@ async function postStory(igUserId, base, imageFile) {
   );
 }
 
-async function postReel(igUserId, base, videoFile, caption) {
+async function postReel(igUserId, videoFile, caption) {
   const video_url = rawUrlFor("videos", videoFile);
   return createAndPublish(
     igUserId,
@@ -109,6 +115,10 @@ async function postReel(igUserId, base, videoFile, caption) {
     { video_url, media_type: "REELS", caption },
     { maxTries: 20, intervalMs: 5000 } // 動画処理は時間がかかるため長めに待つ
   );
+}
+
+function deleteIfExists(filePath) {
+  if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
 }
 
 async function main() {
@@ -119,59 +129,70 @@ async function main() {
 
   const ledger = loadLedger();
 
-  const imageFiles = fs
-    .readdirSync(IMAGES_DIR)
-    .filter((f) => /\.(png|jpe?g)$/i.test(f));
+  const imageFiles = fs.existsSync(IMAGES_DIR)
+    ? fs.readdirSync(IMAGES_DIR).filter((f) => /\.(png|jpe?g)$/i.test(f))
+    : [];
   const videoFiles = fs.existsSync(VIDEOS_DIR)
     ? fs.readdirSync(VIDEOS_DIR).filter((f) => /\.mp4$/i.test(f))
     : [];
 
-  const bases = [...new Set(imageFiles.map((f) => f.replace(/\.[^.]+$/, "")))];
+  const candidates = [...new Set(imageFiles.map((f) => f.replace(/\.[^.]+$/, "")))]
+    .filter((base) => captionFor(base) !== null)
+    .filter((base) => {
+      const done = ledger[base]?.story && ledger[base]?.reel;
+      return !done;
+    })
+    .sort((a, b) => naturalKey(a) - naturalKey(b) || a.localeCompare(b));
 
+  if (candidates.length === 0) {
+    console.log("投稿可能な在庫（画像+キャプションが揃った未投稿分）がありません。今回はスキップします。");
+    return;
+  }
+
+  const base = candidates[0];
+  const imageFile = imageFiles.find((f) => f.replace(/\.[^.]+$/, "") === base);
+  const videoFile = videoFiles.find((f) => f.replace(/\.[^.]+$/, "") === base);
+  const caption = captionFor(base);
+
+  console.log(`[${base}] を投稿します（在庫${candidates.length}件中の先頭）`);
+  ledger[base] = ledger[base] || {};
   let hadError = false;
 
-  for (const base of bases) {
-    const imageFile = imageFiles.find((f) => f.replace(/\.[^.]+$/, "") === base);
-    const videoFile = videoFiles.find((f) => f.replace(/\.[^.]+$/, "") === base);
-    const caption = captionFor(base);
-
-    if (!caption) {
-      console.warn(`[${base}] captions/${base}.txt が未記入のためスキップ`);
-      continue;
+  if (!ledger[base].story) {
+    try {
+      const mediaId = await postStory(igUserId, imageFile);
+      ledger[base].story = { mediaId, postedAt: new Date().toISOString() };
+    } catch (err) {
+      hadError = true;
+      console.error(`  story: 投稿失敗 ${err.message}`);
     }
+    await new Promise((r) => setTimeout(r, 5000));
+  }
 
-    ledger[base] = ledger[base] || {};
-    let didSomething = false;
-
-    console.log(`[${base}] 処理開始`);
-
-    if (!ledger[base].story) {
-      try {
-        const mediaId = await postStory(igUserId, base, imageFile);
-        ledger[base].story = { mediaId, postedAt: new Date().toISOString() };
-        didSomething = true;
-      } catch (err) {
-        hadError = true;
-        console.error(`  story: 投稿失敗 ${err.message}`);
-      }
-      await new Promise((r) => setTimeout(r, 5000));
+  if (!videoFile) {
+    console.warn(`  reel: videos/${base}.mp4 が無いためスキップ`);
+  } else if (!ledger[base].reel) {
+    try {
+      const mediaId = await postReel(igUserId, videoFile, caption);
+      ledger[base].reel = { mediaId, postedAt: new Date().toISOString() };
+    } catch (err) {
+      hadError = true;
+      console.error(`  reel: 投稿失敗 ${err.message}`);
     }
+  }
 
-    if (!videoFile) {
-      console.warn(`  reel: videos/${base}.mp4 が無いためスキップ`);
-    } else if (!ledger[base].reel) {
-      try {
-        const mediaId = await postReel(igUserId, base, videoFile, caption);
-        ledger[base].reel = { mediaId, postedAt: new Date().toISOString() };
-        didSomething = true;
-      } catch (err) {
-        hadError = true;
-        console.error(`  reel: 投稿失敗 ${err.message}`);
-      }
-      await new Promise((r) => setTimeout(r, 5000));
-    }
+  saveLedger(ledger);
 
-    if (didSomething) saveLedger(ledger);
+  // 投稿が完了した分（動画が無い場合はstoryのみで完了扱い）は在庫から削除し、二重投稿を防ぐ
+  const storyDone = !!ledger[base].story;
+  const reelDone = !videoFile || !!ledger[base].reel;
+  if (storyDone && reelDone) {
+    deleteIfExists(path.join(IMAGES_DIR, imageFile));
+    if (videoFile) deleteIfExists(path.join(VIDEOS_DIR, videoFile));
+    deleteIfExists(path.join(CAPTIONS_DIR, `${base}.txt`));
+    console.log(`[${base}] 投稿完了・在庫から削除しました`);
+  } else {
+    console.log(`[${base}] 一部失敗したため在庫に残します（次回リトライ）`);
   }
 
   if (hadError) process.exitCode = 1;

@@ -1,11 +1,10 @@
 name: Post to Instagram
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "images/**"
-      - "videos/**"
+  schedule:
+    - cron: "0 0 * * *"  # 09:00 JST
+    - cron: "0 3 * * *"  # 12:00 JST
+    - cron: "0 11 * * *" # 20:00 JST
   workflow_dispatch: {}
 
 permissions:
@@ -25,19 +24,19 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Post new content to Instagram (story / reel)
+      - name: Post one item from the queue to Instagram (story / reel)
         env:
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: node scripts/post-new.js
+        run: node scripts/post-one.js
 
-      - name: Commit posted.json ledger
+      - name: Commit ledger and remove posted item
         if: always()
         run: |
           git config user.name "ig-auto-poster"
           git config user.email "actions@users.noreply.github.com"
-          git add posted.json
+          git add -A
           if ! git diff --cached --quiet; then
-            git commit -m "chore: update posted.json ledger [skip ci]"
+            git commit -m "chore: post one item + update ledger [skip ci]"
             git push
           fi
