@@ -3,9 +3,7 @@ name: Post to Instagram
 on:
   schedule:
     - cron: "13 0 * * *"  # 09:13 JST
-    - cron: "13 3 * * *"  # 12:13 JST
     - cron: "13 9 * * *"  # 18:13 JST
-    - cron: "13 11 * * *" # 20:13 JST
   workflow_dispatch: {}
 
 permissions:
